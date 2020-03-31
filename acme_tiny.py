@@ -156,7 +156,7 @@ def get_crt(account_key, csr, dnsimple_api_key_path, log=LOGGER, directory_url=D
         challenge = [c for c in authorization['challenges'] if c['type'] == "dns-01"][0]
         token = re.sub(r"[^A-Za-z0-9_\-]", "_", challenge['token'])
         keyauthorization = "{0}.{1}".format(token, thumbprint)
-        txt_record = _b64(hashlib.sha256(keyauthorization.encode('utf8')).digest())
+        record_value = _b64(hashlib.sha256(keyauthorization.encode('utf8')).digest())
 
         # create the DNS record
         wellknown_subdomain = "_acme-challenge.{0}".format(domain)
@@ -167,11 +167,13 @@ def get_crt(account_key, csr, dnsimple_api_key_path, log=LOGGER, directory_url=D
             data=json.dumps({
                 "name": record_name,
                 "type": "TXT",
-                "content": txt_record,
+                "content": record_value,
                 "ttl": 5,
             }).encode("utf-8"),
             headers=dnsimple_headers,
         )[0]["data"]["id"]
+
+        time.sleep(6)
 
         # say the challenge is done
         _send_signed_request(challenge['url'], {}, "Error submitting challenges: {0}".format(domain))
