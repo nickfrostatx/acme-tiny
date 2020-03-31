@@ -156,21 +156,22 @@ def get_crt(account_key, csr, dnsimple_api_key_path, log=LOGGER, directory_url=D
         challenge = [c for c in authorization['challenges'] if c['type'] == "dns-01"][0]
         token = re.sub(r"[^A-Za-z0-9_\-]", "_", challenge['token'])
         keyauthorization = "{0}.{1}".format(token, thumbprint)
+        txt_record = _b64(hashlib.sha256(keyauthorization.encode('utf8')).digest())
 
         # create the DNS record
         wellknown_subdomain = "_acme-challenge.{0}".format(domain)
         assert wellknown_subdomain.endswith(dnsimple_zone)
         record_name = wellknown_subdomain[:-(len(dnsimple_zone) + 1)]  # +1 because of the "."
-        record =_do_request(
+        record_id =_do_request(
             "https://api.dnsimple.com/v2/{0}/zones/{1}/records".format(dnsimple_account, dnsimple_zone),
             data=json.dumps({
                 "name": record_name,
                 "type": "TXT",
-                "content": keyauthorization,
+                "content": txt_record,
                 "ttl": 5,
             }).encode("utf-8"),
             headers=dnsimple_headers,
-        )[0]["data"]
+        )[0]["data"]["id"]
 
         # say the challenge is done
         _send_signed_request(challenge['url'], {}, "Error submitting challenges: {0}".format(domain))
@@ -179,7 +180,7 @@ def get_crt(account_key, csr, dnsimple_api_key_path, log=LOGGER, directory_url=D
             raise ValueError("Challenge did not pass for {0}: {1}".format(domain, authorization))
 
         _do_request(
-            "https://api.dnsimple.com/v2/{0}/zones/{1}/records/{2}".format(dnsimple_account, dnsimple_zone, record["id"]),
+            "https://api.dnsimple.com/v2/{0}/zones/{1}/records/{2}".format(dnsimple_account, dnsimple_zone, record_id),
             method="DELETE",
             headers=dnsimple_headers,
         )
