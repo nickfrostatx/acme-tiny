@@ -12,7 +12,7 @@ LOGGER = logging.getLogger(__name__)
 LOGGER.addHandler(logging.StreamHandler())
 LOGGER.setLevel(logging.INFO)
 
-def get_crt(account_key, csr, acme_dir, log=LOGGER, disable_check=False, directory_url=DEFAULT_DIRECTORY_URL, contact=None):
+def get_crt(account_key, csr, dnsimple_api_key_path, log=LOGGER, directory_url=DEFAULT_DIRECTORY_URL, contact=None):
     directory, acct_headers, alg, jwk = None, None, None, None # global variables
 
     # helper functions - base64 encode for jose spec
@@ -28,13 +28,18 @@ def get_crt(account_key, csr, acme_dir, log=LOGGER, disable_check=False, directo
         return out
 
     # helper function - make request and automatically parse json response
-    def _do_request(url, data=None, err_msg="Error", depth=0):
+    def _do_request(url, data=None, err_msg="Error", headers=None, method=None, depth=0):
         try:
-            resp = urlopen(Request(url, data=data, headers={"Content-Type": "application/jose+json", "User-Agent": "acme-tiny"}))
-            resp_data, code, headers = resp.read().decode("utf8"), resp.getcode(), resp.headers
+            if headers is None:
+                headers = {"Content-Type": "application/jose+json", "User-Agent": "acme-tiny"}
+            request = Request(url, data=data, headers=headers)
+            if method is not None:
+                request.get_method = lambda: method
+            resp = urlopen(request)
+            resp_data, code, resp_headers = resp.read().decode("utf8"), resp.getcode(), resp.headers
         except IOError as e:
             resp_data = e.read().decode("utf8") if hasattr(e, "read") else str(e)
-            code, headers = getattr(e, "code", None), {}
+            code, resp_headers = getattr(e, "code", None), {}
         try:
             resp_data = json.loads(resp_data) # try to parse json results
         except ValueError:
@@ -43,7 +48,7 @@ def get_crt(account_key, csr, acme_dir, log=LOGGER, disable_check=False, directo
             raise IndexError(resp_data) # allow 100 retrys for bad nonces
         if code not in [200, 201, 204]:
             raise ValueError("{0}:\nUrl: {1}\nData: {2}\nResponse Code: {3}\nResponse: {4}".format(err_msg, url, data, code, resp_data))
-        return resp_data, code, headers
+        return resp_data, code, resp_headers
 
     # helper function - make signed requests
     def _send_signed_request(url, payload, err_msg, depth=0):
@@ -99,6 +104,28 @@ def get_crt(account_key, csr, acme_dir, log=LOGGER, disable_check=False, directo
                 domains.add(san[4:])
     log.info("Found domains: {0}".format(", ".join(domains)))
 
+    # Find the dnsimple account and zone
+    with open(dnsimple_api_key_path) as dnsimple_api_key_file:
+        dnsimple_headers = {
+            "Authorization": "Bearer {0}".format(dnsimple_api_key_file.read().strip()),
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        }
+
+    dnsimple_account, dnsimple_zone = None, None
+    for maybe_account in _do_request("https://api.dnsimple.com/v2/accounts", headers=dnsimple_headers)[0]["data"]:
+        for maybe_zone in _do_request("https://api.dnsimple.com/v2/{0}/zones".format(maybe_account["id"]), headers=dnsimple_headers)[0]["data"]:
+            if all(domain.endswith(maybe_zone["name"]) for domain in domains):
+                dnsimple_account = maybe_account["id"]
+                dnsimple_zone = maybe_zone["name"]
+                break
+        if dnsimple_account is not None:
+            break
+
+    assert dnsimple_account is not None, "Could not find Zone in DNSimple account"
+
+    log.info("Using DNSimple account {0} zone {1}".format(dnsimple_account, dnsimple_zone))
+
     # get the ACME directory of urls
     log.info("Getting directory...")
     directory, _, _ = _do_request(directory_url, err_msg="Error getting directory")
@@ -126,26 +153,37 @@ def get_crt(account_key, csr, acme_dir, log=LOGGER, disable_check=False, directo
         log.info("Verifying {0}...".format(domain))
 
         # find the http-01 challenge and write the challenge file
-        challenge = [c for c in authorization['challenges'] if c['type'] == "http-01"][0]
+        challenge = [c for c in authorization['challenges'] if c['type'] == "dns-01"][0]
         token = re.sub(r"[^A-Za-z0-9_\-]", "_", challenge['token'])
         keyauthorization = "{0}.{1}".format(token, thumbprint)
-        wellknown_path = os.path.join(acme_dir, token)
-        with open(wellknown_path, "w") as wellknown_file:
-            wellknown_file.write(keyauthorization)
 
-        # check that the file is in place
-        try:
-            wellknown_url = "http://{0}/.well-known/acme-challenge/{1}".format(domain, token)
-            assert (disable_check or _do_request(wellknown_url)[0] == keyauthorization)
-        except (AssertionError, ValueError) as e:
-            raise ValueError("Wrote file to {0}, but couldn't download {1}: {2}".format(wellknown_path, wellknown_url, e))
+        # create the DNS record
+        wellknown_subdomain = "_acme-challenge.{0}".format(domain)
+        assert wellknown_subdomain.endswith(dnsimple_zone)
+        record_name = wellknown_subdomain[:-(len(dnsimple_zone) + 1)]  # +1 because of the "."
+        record =_do_request(
+            "https://api.dnsimple.com/v2/{0}/zones/{1}/records".format(dnsimple_account, dnsimple_zone),
+            data=json.dumps({
+                "name": record_name,
+                "type": "TXT",
+                "content": keyauthorization,
+                "ttl": 5,
+            }).encode("utf-8"),
+            headers=dnsimple_headers,
+        )[0]["data"]
 
         # say the challenge is done
         _send_signed_request(challenge['url'], {}, "Error submitting challenges: {0}".format(domain))
         authorization = _poll_until_not(auth_url, ["pending"], "Error checking challenge status for {0}".format(domain))
         if authorization['status'] != "valid":
             raise ValueError("Challenge did not pass for {0}: {1}".format(domain, authorization))
-        os.remove(wellknown_path)
+
+        _do_request(
+            "https://api.dnsimple.com/v2/{0}/zones/{1}/records/{2}".format(dnsimple_account, dnsimple_zone, record["id"]),
+            method="DELETE",
+            headers=dnsimple_headers,
+        )
+
         log.info("{0} verified!".format(domain))
 
     # finalize the order with the csr
@@ -166,29 +204,17 @@ def get_crt(account_key, csr, acme_dir, log=LOGGER, disable_check=False, directo
 def main(argv=None):
     parser = argparse.ArgumentParser(
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        description=textwrap.dedent("""\
-            This script automates the process of getting a signed TLS certificate from Let's Encrypt using
-            the ACME protocol. It will need to be run on your server and have access to your private
-            account key, so PLEASE READ THROUGH IT! It's only ~200 lines, so it won't take long.
-
-            Example Usage:
-            python acme_tiny.py --account-key ./account.key --csr ./domain.csr --acme-dir /usr/share/nginx/html/.well-known/acme-challenge/ > signed_chain.crt
-
-            Example Crontab Renewal (once per month):
-            0 0 1 * * python /path/to/acme_tiny.py --account-key /path/to/account.key --csr /path/to/domain.csr --acme-dir /usr/share/nginx/html/.well-known/acme-challenge/ > /path/to/signed_chain.crt 2>> /var/log/acme_tiny.log
-            """)
     )
     parser.add_argument("--account-key", required=True, help="path to your Let's Encrypt account private key")
     parser.add_argument("--csr", required=True, help="path to your certificate signing request")
-    parser.add_argument("--acme-dir", required=True, help="path to the .well-known/acme-challenge/ directory")
+    parser.add_argument("--dnsimple-api-key", required=True, help="path to your DNSimple API key")
     parser.add_argument("--quiet", action="store_const", const=logging.ERROR, help="suppress output except for errors")
-    parser.add_argument("--disable-check", default=False, action="store_true", help="disable checking if the challenge file is hosted correctly before telling the CA")
     parser.add_argument("--directory-url", default=DEFAULT_DIRECTORY_URL, help="certificate authority directory url, default is Let's Encrypt")
     parser.add_argument("--contact", metavar="CONTACT", default=None, nargs="*", help="Contact details (e.g. mailto:aaa@bbb.com) for your account-key")
 
     args = parser.parse_args(argv)
     LOGGER.setLevel(args.quiet or LOGGER.level)
-    signed_crt = get_crt(args.account_key, args.csr, args.acme_dir, log=LOGGER, disable_check=args.disable_check, directory_url=args.directory_url, contact=args.contact)
+    signed_crt = get_crt(args.account_key, args.csr, args.dnsimple_api_key, log=LOGGER, directory_url=args.directory_url, contact=args.contact)
     sys.stdout.write(signed_crt)
 
 if __name__ == "__main__": # pragma: no cover
